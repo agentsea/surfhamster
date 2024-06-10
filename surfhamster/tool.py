@@ -1,11 +1,21 @@
 import os
 import time
 import requests
+import hashlib
+from pydantic import BaseModel, Field
 from random import randint
 
 from agentdesk.device import Desktop
 from taskara import Task
 from toolfuse import Tool, action
+from mllm import RoleMessage, RoleThread, Router
+from rich.console import Console
+from rich.json import JSON
+
+from .image import b64_to_image, image_to_b64, create_grid_image, superimpose_images
+
+router = Router.from_env()
+console = Console()
 
 
 class SemanticDesktop(Tool):
@@ -41,9 +51,123 @@ class SemanticDesktop(Tool):
             type (str): Type of click, can be 'single' for a single click or
                 'double' for a double click. If you need to launch an application from the desktop choose 'double'
         """
-        info = self.desktop.info()
-        screen_size = info["screen_size"]
-        self._click_coords(screen_size["x"] // 2, screen_size["y"] // 2, "single")
+
+        if type != "single" and type != "double":
+            raise ValueError("type must be'single' or 'double'")
+
+        color_number = os.getenv("COLOR_NUMBER", "yellow")
+        color_circle = os.getenv("COLOR_CIRCLE", "red")
+
+        click_hash = hashlib.md5(description.encode()).hexdigest()[:5]
+
+        class ZoomSelection(BaseModel):
+            """Zoom selection model"""
+
+            number: int = Field(
+                ...,
+                description=f"Number of the dot closest to the place we want to click.",
+            )
+
+        current_img_b64 = self.desktop.take_screenshot()
+        current_img = b64_to_image(current_img_b64)
+        img_width, img_height = current_img.size
+
+        # number of "cells" along one side; the numbers are in the corners of those "cells"
+        n = 10
+
+        thread = RoleThread()
+
+        prompt = f"""
+        You are an experienced AI trained to find the elements on the screen.
+        You see a screenshot of the web application. 
+        I have drawn some big {color_number} numbers on {color_circle} circles on this image 
+        to help you to find required elements.
+        Please tell me the closest big {color_number} number on a {color_circle} circle to the center of the {description}.
+        Please note that some circles may lay on the {description}. If that's the case, return the number in any of these circles.
+        Please return you response as raw JSON following the schema {ZoomSelection.model_json_schema()}
+        Be concise and only return the raw json, for example if the circle you wanted to select had a number 3 in it
+        you would return {{"number": 3}}
+        """
+
+        self.task.post_message(
+            role="assistant",
+            msg=f"Clicking '{type}' on object '{description}'",
+            thread="debug",
+            images=[image_to_b64(current_img)],
+        )
+
+        image_path = os.path.join(self.img_path, f"{click_hash}_current.png")
+        current_img.save(image_path)
+        img_width, img_height = current_img.size
+
+        screenshot_b64 = image_to_b64(current_img)
+        self.task.post_message(
+            role="assistant",
+            msg=f"Current image",
+            thread="debug",
+            images=[screenshot_b64],
+        )
+
+        grid_path = os.path.join(self.img_path, f"{click_hash}_grid.png")
+        create_grid_image(
+            img_width, img_height, color_circle, color_number, n, grid_path
+        )
+
+        merged_image_path = os.path.join(
+            self.img_path, f"{click_hash}_merge.png"
+        )
+        merged_image = superimpose_images(image_path, grid_path, 1)
+        merged_image.save(merged_image_path)
+
+        merged_image_b64 = image_to_b64(merged_image)
+        self.task.post_message(
+            role="assistant",
+            msg=f"Merged image",
+            thread="debug",
+            images=[merged_image_b64],
+        )
+
+        msg = RoleMessage(
+            role="user",
+            text=prompt,
+            images=[merged_image_b64],
+        )
+        thread.add_msg(msg)
+
+        response = router.chat(
+            thread, namespace="zoom", expect=ZoomSelection, agent_id="SurfHamster", retries=1
+        )
+        if not response.parsed:
+            raise SystemError("No response parsed from zoom")
+        
+        self.task.add_prompt(response.prompt)
+
+        zoom_resp = response.parsed
+        self.task.post_message(
+            role="assistant",
+            msg=f"Selection {zoom_resp.model_dump_json()}",
+            thread="debug",
+        )
+        console.print(JSON(zoom_resp.model_dump_json()))
+        chosen_number = zoom_resp.number
+
+        # We convert the chosen number into screen coordinates
+        # of the corresponding dot on the grid
+        x_cell = (chosen_number - 1) // (n - 1) + 1
+        y_cell = (chosen_number - 1) % (n - 1) + 1
+        cell_width = img_width // n
+        cell_height = img_height // n
+        click_x = x_cell * cell_width
+        click_y = y_cell * cell_height
+
+        self.task.post_message(
+            role="assistant",
+            msg=f"Clicking coordinates {click_x}, {click_y}",
+            thread="debug",
+        )
+        self._click_coords(x=click_x, y=click_y, type=type)
+        return
+
 
     def _click_coords(self, x: int, y: int, type: str = "single") -> None:
         """Click mouse button

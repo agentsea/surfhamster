@@ -16,6 +16,7 @@ requests = "^2.31.0"
 fastapi = {version = "^0.109", extras = ["all"]}
 surfkit = "^0.1.206"
 pillow = "^10.0.0"
+pytesseract = "^0.3.10"
 
 
 [tool.poetry.group.dev.dependencies]

@@ -4,6 +4,7 @@ import requests
 import hashlib
 from pydantic import BaseModel, Field
 from random import randint
+from PIL import Image
 
 from agentdesk.device import Desktop
 from taskara import Task
@@ -12,6 +13,7 @@ from mllm import RoleMessage, RoleThread, Router
 from rich.console import Console
 from rich.json import JSON
 
+from .ocr import find_boxes_with_text, draw_bbs
 from .image import b64_to_image, image_to_b64, create_grid_image, superimpose_images
 
 router = Router.from_env()
@@ -55,6 +57,87 @@ class SemanticDesktop(Tool):
         if type != "single" and type != "double":
             raise ValueError("type must be'single' or 'double'")
 
+        coords = self._ocr_based_click(description, type)
+        if coords is None:
+            coords = self._grid_based_click(description, type)
+        
+        click_x = coords["x"]
+        click_y = coords["y"]
+
+        self.task.post_message(
+            role="assistant",
+            msg=f"Clicking coordinates {click_x}, {click_y}",
+            thread="debug",
+        )
+        self._click_coords(x=click_x, y=click_y, type=type)
+        return
+
+    def _ocr_based_click(self, description: str, type: str) -> dict:
+        # We'll try to use OCR when there is some text in the description
+        # of the next step (e.g. "Click on 'Search' button")
+        if '\'' in description:
+            obj = description.split('\'')[1]
+        elif '\"' in description:
+            obj = description.split('\"')[1]
+        else:
+            return None
+        
+        click_hash = hashlib.md5(description.encode()).hexdigest()[:5]
+
+        current_img_b64 = self.desktop.take_screenshot()
+        current_img = b64_to_image(current_img_b64)
+
+        self.task.post_message(
+            role="assistant",
+            msg=f"Clicking '{type}' on object '{description}'",
+            thread="debug",
+            images=[image_to_b64(current_img)],
+        )
+        self.task.post_message(
+            role="assistant",
+            msg=f"Looking for '{obj}' with OCR",
+            thread="debug",
+            images=[image_to_b64(current_img)],
+        )
+
+        image_path = os.path.join(self.img_path, f"{click_hash}_current.png")
+        current_img.save(image_path)
+
+        screenshot_b64 = image_to_b64(current_img)
+        self.task.post_message(
+            role="assistant",
+            msg=f"Current image",
+            thread="debug",
+            images=[screenshot_b64],
+        )
+
+        boxes = find_boxes_with_text(image_path, obj)
+        if len(boxes) == 0:
+            self.task.post_message(
+                role="assistant",
+                msg=f"Didn't find any '{obj}' with OCR",
+                thread="debug",
+                images=[image_to_b64(current_img)],
+            )
+            return None
+        
+        boxes_path = os.path.join(self.img_path, f"{click_hash}_boxes.png")
+        draw_bbs(boxes, image_path, boxes_path)     
+        self.task.post_message(
+            role="assistant",
+            msg=f"Found boxes",
+            thread="debug",
+            images=[image_to_b64(Image.open(boxes_path))],
+        )
+
+        selected_box = boxes[0]
+        return {
+            "x": selected_box["x"] + selected_box["w"] // 2,
+            "y": selected_box["y"] + selected_box["h"] // 2
+        }
+
+
+    def _grid_based_click(self, description: str, type: str) -> dict:
         color_number = os.getenv("COLOR_NUMBER", "yellow")
         color_circle = os.getenv("COLOR_CIRCLE", "red")
 
@@ -160,13 +243,10 @@ class SemanticDesktop(Tool):
         click_x = x_cell * cell_width
         click_y = y_cell * cell_height
 
-        self.task.post_message(
-            role="assistant",
-            msg=f"Clicking coordinates {click_x}, {click_y}",
-            thread="debug",
-        )
-        self._click_coords(x=click_x, y=click_y, type=type)
-        return
+        return {
+            "x": click_x, 
+            "y": click_y
+        }
 
 
     def _click_coords(self, x: int, y: int, type: str = "single") -> None:

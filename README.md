@@ -7,6 +7,9 @@ The AI agent that can navigate GUIs and do tasks in them.
 pip install surfkit
 ```
 
+You also need to install Tesseract 5 on your machine. 
+See [Installation instructions](https://tesseract-ocr.github.io/tessdoc/Installation.html).
+
 ## Usage
 
 Create an agent

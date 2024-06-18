@@ -37,3 +37,7 @@ Delete the agent
 surfkit delete agent --name foo
 ```
 
+## Community
+
+Come join us on [Discord](https://discord.gg/hhaq7XYPS6).
+
